@@ -388,8 +388,100 @@ struct Context {
   Vec3 n0{0,1,0}; float d0{1};
 };
 
+#include <opencv2/opencv.hpp>
+#include <filesystem>
+namespace fs = std::filesystem;
+
+// דוגמת utility: פונקציה לפתיחת מצלמות או קבצי וידאו
+inline bool openCameras(std::array<cv::VideoCapture,4>& caps, const std::array<std::string,4>& sources) {
+    for (int i = 0; i < 4; ++i) {
+        if (sources[i].empty()) continue;
+        if (!caps[i].open(sources[i])) {
+            std::cerr << "❌ Failed to open camera/video source " << i << ": " << sources[i] << std::endl;
+            return false;
+        }
+        caps[i].set(cv::CAP_PROP_FRAME_WIDTH,  1280);
+        caps[i].set(cv::CAP_PROP_FRAME_HEIGHT, 720);
+        caps[i].set(cv::CAP_PROP_FPS, 30);
+    }
+    return true;
+}
+
+// פונקציה ראשית: captureLoop מלא
+inline void captureLoop(Context& ctx)
+{
+    using namespace std::chrono;
+
+    // 📸 פתיחת מצלמות או וידאו לפי מקור
+    static std::array<cv::VideoCapture,4> caps;
+    static bool initialized = false;
+    if (!initialized)
+    {
+        std::array<std::string,4> sources = {
+            "0",  // מצלמה קדמית (אם מצלמה USB מחוברת)
+            "1",  // מצלמה אחורית
+            "2",  // מצלמה ימין
+            "3"   // מצלמה שמאל
+            // אפשר להחליף גם לנתיבי קבצים: "data/front.mp4", "data/rear.mp4", ...
+        };
+
+        if (!openCameras(caps, sources)) {
+            std::cerr << "⚠️ Capture init failed — running dummy frames instead\n";
+        }
+        initialized = true;
+    }
+
+    cv::Mat frames[4];
+    int frameCounter = 0;
+
+    while (!ctx.th.stop.load())
+    {
+        FrameView fv{};
+        fv.ts.frame_id = ctx.timers.frame_id.fetch_add(1);
+        fv.ts.mono_ns  = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+
+        bool ok = true;
+        for (int i = 0; i < 4; ++i)
+        {
+            if (caps[i].isOpened()) {
+                ok &= caps[i].read(frames[i]);
+                if (!ok) {
+                    // אם הסתיים וידאו — לחזור להתחלה
+                    caps[i].set(cv::CAP_PROP_POS_FRAMES, 0);
+                    caps[i].read(frames[i]);
+                }
+            } else {
+                // במקרה שאין מצלמה, ניצור תמונה שחורה
+                frames[i] = cv::Mat::zeros(cv::Size(640,360), CV_8UC3);
+                cv::putText(frames[i], "Dummy Cam "+std::to_string(i),
+                            {20,200}, cv::FONT_HERSHEY_SIMPLEX, 1.0,
+                            cv::Scalar(0,255,0), 2);
+            }
+
+            // נכניס את מצביעי הנתונים ל־FrameView
+            fv.img[i]    = frames[i].data;
+            fv.w[i]      = frames[i].cols;
+            fv.h[i]      = frames[i].rows;
+            fv.stride[i] = static_cast<int>(frames[i].step);
+        }
+
+        // 🌀 דחיפה לתור (queue)
+        if (!ctx.q.q1.push(std::move(fv)))
+            ctx.tm.drops1++;
+
+        size_t s = ctx.q.q1.size();
+        if (s > ctx.tm.q1_max) ctx.tm.q1_max = s;
+
+        // המתנה קטנה לשמירה על קצב ~30fps
+        std::this_thread::sleep_for(std::chrono::milliseconds(33));
+        ++frameCounter;
+    }
+
+    // ניקוי
+    for (auto& c : caps) if (c.isOpened()) c.release();
+}
 // ============================ Stage: Capture ============================
-inline void captureLoop(Context& ctx){
+inline void captureLoop_(Context& ctx){
   using namespace std::chrono;
   while(!ctx.th.stop.load()){
     FrameView fv{};
