@@ -1,0 +1,9 @@
+﻿.vs/
+x64/
+Debug/
+Release/
+*.opendb
+*.VC.db
+*.user
+*.suo
+*.vsidx
