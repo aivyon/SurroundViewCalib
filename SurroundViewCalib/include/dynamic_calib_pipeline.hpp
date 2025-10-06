@@ -494,7 +494,155 @@ inline void captureLoop_(Context& ctx){
 }
 
 // ============================ Stage: Features ============================
-inline void featuresLoop(Context& ctx){
+#include <opencv2/opencv.hpp>
+#include <opencv2/features2d.hpp>
+#include <opencv2/video/tracking.hpp>
+#include <numeric>
+
+inline void featuresLoop(Context& ctx)
+{
+    int tick = 0;
+
+    // יצירת ORB detector ו-LK parameters
+    cv::Ptr<cv::ORB> orb = cv::ORB::create(1000);
+    cv::Size winSize(21,21);
+    cv::TermCriteria termcrit(cv::TermCriteria::COUNT|cv::TermCriteria::EPS, 30, 0.01);
+
+    std::vector<cv::Point2f> prevPts[4], currPts[4];
+    std::vector<cv::Mat> prevGray(4);
+
+    while(!ctx.th.stop.load())
+    {
+        auto fv = ctx.q.q1.pop();
+        if(!fv){ std::this_thread::sleep_for(std::chrono::microseconds(200)); continue; }
+
+        FeaturesMsg fm{};
+        fm.fv = *fv;
+        bool runHeavy = (tick % ctx.rcfg.features_rate)==0;
+
+        cv::Mat framesGray[4];
+        for (int i = 0; i < 4; ++i)
+        {
+            cv::Mat img(cv::Size(fv->w[i], fv->h[i]), CV_8UC3, fv->img[i], fv->stride[i]);
+            cv::cvtColor(img, framesGray[i], cv::COLOR_BGR2GRAY);
+        }
+
+        // ========== 1. detect+describe (ORB) ==========
+        std::vector<cv::KeyPoint> kps[4];
+        cv::Mat desc[4];
+        for (int i = 0; i < 4; ++i)
+        {
+            if(runHeavy || prevGray[i].empty())
+                orb->detectAndCompute(framesGray[i], cv::noArray(), kps[i], desc[i]);
+        }
+
+        // ========== 2. LK optical flow (per camera) ==========
+        for (int i = 0; i < 4; ++i)
+        {
+            if(!prevGray[i].empty() && !prevPts[i].empty())
+            {
+                std::vector<uchar> status;
+                std::vector<float> err;
+                currPts[i].resize(prevPts[i].size());
+                cv::calcOpticalFlowPyrLK(prevGray[i], framesGray[i],
+                                          prevPts[i], currPts[i],
+                                          status, err, winSize, 3, termcrit);
+
+                // סינון נקודות לא תקפות
+                std::vector<cv::Point2f> goodPrev, goodCurr;
+                for(size_t j=0;j<status.size();++j)
+                    if(status[j]){ goodPrev.push_back(prevPts[i][j]); goodCurr.push_back(currPts[i][j]); }
+
+                fm.tracks[i].resize(goodPrev.size());
+                for(size_t j=0;j<goodPrev.size();++j){
+                    fm.tracks[i][j].p_prev = {goodPrev[j].x, goodPrev[j].y,1};
+                    fm.tracks[i][j].p_cur  = {goodCurr[j].x, goodCurr[j].y,1};
+                    fm.tracks[i][j].ok = true;
+                }
+            }
+        }
+
+        // ========== 3. seam matching (pairwise homographies) ==========
+        float totalResidual = 0.0f;
+        int seamPairs = 0;
+        for (int i = 0; i < 4; ++i)
+        {
+            int j = (i+1)%4; // מצלמה סמוכה
+            if(!desc[i].empty() && !desc[j].empty())
+            {
+                cv::BFMatcher matcher(cv::NORM_HAMMING);
+                std::vector<cv::DMatch> matches;
+                matcher.match(desc[i], desc[j], matches);
+
+                // סינון התאמות רעות
+                double maxDist = 0; double minDist = 100;
+                for (auto& m : matches){ double dist = m.distance; if(dist<minDist) minDist=dist; if(dist>maxDist) maxDist=dist; }
+                std::vector<cv::Point2f> pts1, pts2;
+                for (auto& m : matches)
+                    if(m.distance <= std::max(2*minDist, 30.0))
+                    {
+                        pts1.push_back(kps[i][m.queryIdx].pt);
+                        pts2.push_back(kps[j][m.trainIdx].pt);
+                    }
+
+                if(pts1.size() >= 4)
+                {
+                    std::vector<uchar> mask;
+                    cv::Mat H = cv::findHomography(pts1, pts2, cv::RANSAC, 3, mask);
+                    float inliers = std::accumulate(mask.begin(), mask.end(), 0.0f);
+                    float residual = (float)cv::norm(pts1, pts2, cv::NORM_L2) / (float)pts1.size();
+                    totalResidual += residual;
+                    seamPairs++;
+                    fm.seamq.inliers_ratio = inliers / (float)mask.size();
+                    fm.seamq.residual = residual;
+                }
+            }
+        }
+        if(seamPairs>0) totalResidual /= seamPairs;
+        fm.seamq.conf = std::clamp(1.0f - totalResidual/10.0f, 0.0f, 1.0f);
+
+        // ========== 4. light VO (Essential matrix) ==========
+        for (int i = 0; i < 4; ++i)
+        {
+            if (fm.tracks[i].size() >= 8)
+            {
+                std::vector<cv::Point2f> p1, p2;
+                for(auto& t : fm.tracks[i]){ p1.push_back({t.p_prev.x, t.p_prev.y}); p2.push_back({t.p_cur.x, t.p_cur.y}); }
+                std::vector<uchar> mask;
+                cv::Mat E = cv::findEssentialMat(p1, p2, 1.0, cv::Point2d(0,0), cv::RANSAC, 0.999, 1.0, mask);
+                if(!E.empty())
+                {
+                    int inliers = cv::countNonZero(mask);
+                    fm.voq.inliers = inliers;
+                    fm.voq.residual = totalResidual;
+                    fm.voq.conf = std::clamp(inliers / float(p1.size()), 0.0f, 1.0f);
+                }
+            }
+        }
+
+        // ========== 5. Fill Feature Quality ==========
+        // מדד מרקם/פיזור לפי כמות הפיצ׳רים (יחסי לגודל התמונה)
+        int totalKP = 0;
+        for (int i=0;i<4;i++) totalKP += (int)kps[i].size();
+        float texDensity = totalKP / (4.0f * fv->w[0] * fv->h[0]);
+        fm.featq.tex_density = texDensity;
+        fm.featq.tex_spread  = std::clamp(runHeavy ? 0.6f : 0.5f, 0.0f, 1.0f);
+
+        // ========== push forward ==========
+        if(!ctx.q.q2.push(std::move(fm))) ctx.tm.drops2++;
+        size_t s = ctx.q.q2.size(); if(s > ctx.tm.q2_max) ctx.tm.q2_max = s;
+
+        // לשמור פריים קודם לעקיבה
+        for(int i=0;i<4;i++){
+            prevGray[i] = framesGray[i].clone();
+            cv::KeyPoint::convert(kps[i], prevPts[i]);
+        }
+
+        ++tick;
+    }
+}
+
+inline void featuresLoop_(Context& ctx){
   int tick=0;
   while(!ctx.th.stop.load()){
     auto fv = ctx.q.q1.pop();
