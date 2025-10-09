@@ -10,7 +10,6 @@ int main() {
   // --- Init context & config ---
   Context ctx;
   ctx.cfg = Config{};
-  ctx.rcfg = RtConfig{};
   ctx.cfg.ref_cam_id = 0;          // front camera
   ctx.cfg.step.alpha = 1.0f;       // full step fraction
   ctx.cfg.step.max_rot_rad = 0.02f;
@@ -19,16 +18,14 @@ int main() {
   ctx.cfg.step.max_t_meters= 0.01f;
 
   // example intrinsics (identity for simplicity)
-  for(int c=0;c<4;c++){ ctx.K[c] = Mat3::I(); }
-
-  // ground reference (flat ground)
-  ctx.n0 = {0,1,0};
-  ctx.d0 = 1.0f;
   for(int c=0;c<4;c++){
-    ctx.curPose[c].R = Mat3::I();
-    ctx.curPose[c].t = {0,0,0};
-    ctx.curPose[c].n = ctx.n0;
-    ctx.curPose[c].d = ctx.d0;
+    ctx.cams[c].K = Mat3::I();
+    ctx.cams[c].R = Mat3::I();
+    ctx.cams[c].t = {0,0,0};
+    ctx.cams[c].n = {0,1,0};
+    ctx.cams[c].d = 1.0f;
+    ctx.cams[c].H_ground = compose_H_from_pose_plane(ctx.cams[c].K, ctx.cams[c].R,
+                                                     ctx.cams[c].t, ctx.cams[c].n, ctx.cams[c].d);
   }
 
   // --- Start threads ---
