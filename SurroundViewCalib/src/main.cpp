@@ -1,4 +1,3 @@
-// ============================ main.cpp ============================
 #include "dynamic_calib_pipeline.hpp"
 #include <iostream>
 #include <csignal>
@@ -50,7 +49,7 @@ int main() {
             << " q4_max=" << ctx.tm.q4_max << "\n";
   std::cout << "Drops: " << ctx.tm.drops1 << "," << ctx.tm.drops2
             << "," << ctx.tm.drops3 << "," << ctx.tm.drops4 << "\n";
-  std::cout << "Mode=" << toString(ctx.mode.load()) 
+  std::cout << "Mode=" << toString(ctx.mode.load())
             << " frames_in_state=" << ctx.frames_in_state.load() << "\n";
   std::cout << "Done.\n";
   return 0;
