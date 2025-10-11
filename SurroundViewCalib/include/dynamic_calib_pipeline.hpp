@@ -1,7 +1,7 @@
 #pragma once
 /******************************************************
  * Dynamic Surround-View Calibration – Single Header
- * C++20 / OpenCV
+ * C++20 / Visual Studio 2022 / OpenCV
  * Stages: Capture → Features → GroundEst → Update/H → Render
  ******************************************************/
 
@@ -35,7 +35,7 @@ inline const char* toString(Mode m){
   switch(m){ case Mode::CHAIN: return "CHAIN"; case Mode::VO:return "VO"; case Mode::PIECEWISE:return "PIECEWISE"; }
   return "UNKNOWN";
 }
-struct Timestamp { int64_t mono_ns{0}; int64_t frame_id{0}; }
+struct Timestamp { int64_t mono_ns{0}; int64_t frame_id{0}; };
 
 /*==================== Config / Thresholds ====================*/
 struct Rates{ int FEATURES=2, CHAIN=3, VO=6, PIECEWISE=10, REBUILD=50; };
@@ -69,9 +69,27 @@ struct FeaturesMsg{
   std::vector<Track>    tracks[4];
   FeatQuality featq; SeamQuality seamq; VOQuality voq;
 };
-struct PlaneEstimate{ float n[3]{0,1,0}; float d{1}; PlaneQuality q; };
-struct GpeMsg{ FeaturesMsg base; Mode mode{Mode::CHAIN}; PlaneEstimate plane; float conf{0}; };
-struct CalibUpdateMsg{ GpeMsg gpe; float dH[4][9]{}; float conf{0}; bool lut_rebuild{false}; };
+
+struct PlaneEstimate{
+  float n[3]{0,1,0}; float d{1};
+  PlaneQuality q;
+};
+
+struct GpeMsg{
+  FeaturesMsg base;
+  Mode mode{Mode::CHAIN};
+  PlaneEstimate plane;
+  float conf{0};
+  bool request_lut_rebuild{false};   // <<< explicit event flag
+};
+
+struct CalibUpdateMsg{
+  GpeMsg gpe;
+  float dH[4][9]{};   // target H (or ΔH by your policy)
+  float conf{0};
+  bool lut_rebuild{false};
+};
+
 struct BevFrame{ CalibUpdateMsg cu; /*optional visual output*/ };
 
 /*==================== SPSC ring (bounded) ====================*/
@@ -191,7 +209,6 @@ struct CameraRuntime{
 };
 
 template<class T,size_t N> using Ring = SpscRing<T,N>;
-
 struct Threads{ std::thread tCap,tFeat,tGpe,tUpd,tRend; std::atomic<bool> stop{false}; };
 
 struct Context{
@@ -210,7 +227,7 @@ struct Context{
   std::atomic<int>   frames_in_state{0};
 };
 
-/*==================== Policies ====================*/
+/*==================== Rebuild Policy ====================*/
 inline bool should_rebuild_LUT(const Context& ctx,const CameraRuntime& cam,const Mat3& H_new,int frame_now,
                                int period_frames=50,float drift_tau=0.05f){
   auto driftExceeded=[&](const Mat3&A,const Mat3&B){ float acc=0.f; for(int i=0;i<9;i++){ float d=B.m[i]-A.m[i]; acc+=d*d; } return std::sqrt(acc)>drift_tau; };
@@ -233,7 +250,7 @@ inline void captureLoop(Context& ctx){
   using namespace std::chrono;
   static std::array<cv::VideoCapture,4> caps; static bool initialized=false;
   if(!initialized){
-    std::array<std::string,4> sources = {"0","1","2","3"}; // אפשר להחליף ל-"data/front.mp4" וכו'
+    std::array<std::string,4> sources = {"0","1","2","3"}; // or "data/front.mp4", ...
     if(!openCameras(caps,sources)) std::cerr<<"⚠️ Capture init failed — dummy frames\n";
     initialized=true;
   }
@@ -313,7 +330,7 @@ inline void featuresLoop(Context& ctx){
         std::vector<cv::Point2f> p1,p2;
         for(auto& mm:matches) if(mm.distance<=std::max(2*minD,30.0)){ p1.push_back(kps[i][mm.queryIdx].pt); p2.push_back(kps[j][mm.trainIdx].pt); }
         if(p1.size()>=4){
-          std::vector<uchar> mask; cv::Mat H=cv::findHomography(p1,p2,cv::RANSAC,3,mask);
+          std::vector<uchar> mask; (void)cv::findHomography(p1,p2,cv::RANSAC,3,mask);
           float inl=(float)cv::countNonZero(mask);
           float resid = (float)cv::norm(p1,p2,cv::NORM_L2)/(float)p1.size();
           fm.seamq.inliers_ratio = inl/(float)mask.size(); fm.seamq.residual=resid;
@@ -324,7 +341,7 @@ inline void featuresLoop(Context& ctx){
     if(seamPairs>0) totalResidual/=seamPairs;
     fm.seamq.conf = clamp01(1.f - totalResidual/10.f);
 
-    // light VO
+    // light VO (per camera)
     for(int i=0;i<4;i++){
       if(fm.tracks[i].size()>=8){
         std::vector<cv::Point2f> a,b; a.reserve(fm.tracks[i].size()); b.reserve(fm.tracks[i].size());
@@ -347,41 +364,54 @@ inline void featuresLoop(Context& ctx){
   }
 }
 
-/*==================== GPE (stubs) ====================*/
+/*==================== GPE (with LUT-event flag) ====================*/
 inline void gpeLoop(Context& ctx){
   ConfidenceFusion fuse;
+  static Mode prev_mode = Mode::CHAIN;
+
   while(!ctx.th.stop.load()){
     auto fm=ctx.q.q2.pop(); if(!fm){ std::this_thread::sleep_for(std::chrono::microseconds(200)); continue; }
     GpeMsg gm{}; gm.base=*fm;
 
-    // החלטת מצב פשוטה (אפשר לשדרג ל-FSM)
+    // מצב לפי סיגנלים פשוטים (אפשר להחליף ל-FSM)
     bool slow = (ctx.speed_mps.load()<=ctx.cfg.th.SLOW_SPEED);
     if(slow && fm->featq.tex_spread>=ctx.cfg.th.TEX_SPREAD_MIN && fm->seamq.conf>=ctx.cfg.th.SEAM_CONF_MIN) gm.mode=Mode::CHAIN;
     else { gm.mode = (ctx.planarity_norm.load()>=ctx.cfg.th.PLANAR_BAD) ? Mode::PIECEWISE : Mode::VO; }
 
-    // Plane estimate (stub reasonable)
-    if(gm.mode==Mode::CHAIN){ gm.plane={ {0,1,0}, 1.0f, {0.6f,0.3f} }; }
-    else if(gm.mode==Mode::VO){ gm.plane={ {0,1,0}, 1.0f, {0.65f,0.28f} }; }
-    else { gm.plane={ {0,1,0}, 1.0f, {0.7f,0.25f} }; }
+    // Plane estimate (stubs סבירים)
+    if (gm.mode == Mode::CHAIN)      gm.plane = { {0,1,0}, 1.0f, {0.60f, 0.30f} };
+    else if (gm.mode == Mode::VO)    gm.plane = { {0,1,0}, 1.0f, {0.70f, 0.25f} };
+    else /*PIECEWISE*/               gm.plane = { {0,1,0}, 1.0f, {0.75f, 0.22f} };
 
     gm.conf = fuse.fuse(fm->featq, fm->seamq, fm->voq, gm.plane.q);
+
+    // ===== Event trigger for LUT rebuild =====
+    bool good_plane  = (gm.plane.q.inliers_ratio >= 0.60f) && (gm.plane.q.residual <= 0.35f);
+    bool mode_change = (gm.mode != prev_mode);
+    gm.request_lut_rebuild = good_plane || mode_change;
+    prev_mode = gm.mode;
+
     if(!ctx.q.q3.push(std::move(gm))) ctx.tm.drops3++;
     size_t s=ctx.q.q3.size(); if(s>ctx.tm.q3_max) ctx.tm.q3_max=s;
   }
 }
 
-/*==================== Update (target H) ====================*/
+/*==================== Update (target H + carry lut flag) ====================*/
 inline void updateLoop(Context& ctx){
   while(!ctx.th.stop.load()){
     auto gm=ctx.q.q3.pop(); if(!gm){ std::this_thread::sleep_for(std::chrono::microseconds(200)); continue; }
     CalibUpdateMsg cu{}; cu.gpe=*gm; cu.conf=gm->conf;
 
-    // בונים H יעד מכל מצלמה (כרגע מ-(K,R,t,n,d) – אפשר לשלב Stepper)
+    // H יעד מכל מצלמה (כעת מ-(K,R,t,n,d), אפשר לשלב Stepper)
     for(int c=0;c<4;c++){
-      Mat3 Ht = compose_H_from_pose_plane(ctx.cams[c].K, ctx.cams[c].R, ctx.cams[c].t, {gm->plane.n[0],gm->plane.n[1],gm->plane.n[2]}, gm->plane.d);
+      Mat3 Ht = compose_H_from_pose_plane(ctx.cams[c].K, ctx.cams[c].R, ctx.cams[c].t,
+                                          {gm->plane.n[0],gm->plane.n[1],gm->plane.n[2]}, gm->plane.d);
       for(int i=0;i<9;i++) cu.dH[c][i]=Ht.m[i];
     }
-    cu.lut_rebuild=false; // rebuild לפי policy ב-render
+
+    // carry event + periodic ping (every REBUILD frames)
+    bool periodic_request = (ctx.frame_global % ctx.cfg.rates.REBUILD)==0;
+    cu.lut_rebuild = gm->request_lut_rebuild || periodic_request;
 
     if(!ctx.q.q4.push(std::move(cu))) ctx.tm.drops4++;
     size_t s=ctx.q.q4.size(); if(s>ctx.tm.q4_max) ctx.tm.q4_max=s;
@@ -398,11 +428,15 @@ inline void renderLoop(Context& ctx){
 
     if(cu->conf >= ctx.cfg.th.CONF_GATE){
       bool any_need_rebuild=cu->lut_rebuild;
+
+      // 1) Commit H יעד + בדיקת drift/period
       for(int c=0;c<4;c++){
         Mat3 Hnew{}; for(int i=0;i<9;i++) Hnew.m[i]=cu->dH[c][i];
         if(!any_need_rebuild) any_need_rebuild |= should_rebuild_LUT(ctx, ctx.cams[c], Hnew, ctx.frame_global);
         ctx.cams[c].H_ground = Hnew;
       }
+
+      // 2) בניית LUT (double-buffer) – לפי K,R,t,n,d
       if(any_need_rebuild){
         for(int c=0;c<4;c++){
           ctx.cams[c].lut_building = std::make_unique<Lut>(
@@ -416,21 +450,27 @@ inline void renderLoop(Context& ctx){
       }
     }
 
+    // 3) if no LUT — skip
     bool haveAll=true; for(int c=0;c<4;c++) if(!ctx.cams[c].lut_active){ haveAll=false; break; }
     if(!haveAll){ ctx.frame_global++; continue; }
 
+    // 4) grab latest camera frames
     std::array<cv::Mat,4> camImg;
     { std::lock_guard<std::mutex> lk(ctx.latest.m);
       for(int c=0;c<4;c++) camImg[c]=ctx.latest.bgr[c];
     }
     if(camImg[0].empty()||camImg[1].empty()||camImg[2].empty()||camImg[3].empty()){ ctx.frame_global++; continue; }
 
+    // 5) project 4 tiles to BEV
     std::array<cv::Mat,4> tiles;
     for(int c=0;c<4;c++) tiles[c]=project_to_bev(camImg[c], *ctx.cams[c].lut_active);
 
+    // 6) stitch
     cv::Mat bev = stitch_tiles(tiles);
-    // הצגה אופציונלית:
-    // cv::imshow("BEV", bev); cv::waitKey(1);
+
+    // 7) (optional) preview
+    // cv::imshow("BEV", bev);
+    // cv::waitKey(1);
 
     ctx.frame_global++;
   }
